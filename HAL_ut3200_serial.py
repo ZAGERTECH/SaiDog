@@ -193,8 +193,9 @@ def HAL_UT3200_CollectTempData_Thread(ser, stop_event,ut3200_routes, data_write_
     ser：已配置的串口句柄，本线程不负责关闭。
     stop_event：threading.Event，由主线程或任一采集线程设置以通知停止。
     ut3200_routes：[(设备下标, 设备内信号下标, 温度数组下标), ...]，三项均从 0 开始。
-    data_write_callback：接收 updates 列表的函数对象，通常为 BLL_DataWrite；
-        每项为 (设备下标, 信号下标, float 温度值)，返回值不使用。
+    data_write_callback：通常为 BLL_DataWrite，调用形式为 (updates, timestamp)。
+        updates 每项为 (设备下标, 信号下标, float 温度值)。
+        timestamp 是本机读到这一批温度的时间，精确到毫秒。返回值不使用。
         温度列表中不存在的源下标不提交，对应信号保留旧值。
     """
     try:
@@ -204,6 +205,8 @@ def HAL_UT3200_CollectTempData_Thread(ser, stop_event,ut3200_routes, data_write_
             next_t += interval
             values = HAL_UT3200_FetchTemperatures(ser)  # list[float] 或 None，供路由 source_index 索引
             if values:
+                # 读到一批有效温度后记录本机时间，整批通道共用这个时间戳。
+                timestamp = datetime.now().isoformat(sep=" ", timespec="milliseconds")
                 # list[tuple[int, int, float]]；第三项是取出的温度值，不再是路由中的源下标。
                 updates = []
 
@@ -212,8 +215,9 @@ def HAL_UT3200_CollectTempData_Thread(ser, stop_event,ut3200_routes, data_write_
                         updates.append(
                             (device_index, signal_index, values[source_index])
                         )
-                data_write_callback(updates)
-                print([f"{v:.2f}" for v in values])
+                # 将批次时间和通道数据一起交给 BLL，采集日志也使用这个时间。
+                data_write_callback(updates, timestamp)
+                print(f"[UT3200] {timestamp} {[f'{v:.2f}' for v in values]}")
 
             delay = next_t - time.monotonic()  # 本周期剩余等待秒数，扣除查询与回调耗时
             if delay > 0:
@@ -240,7 +244,7 @@ def HAL_UT3200_RunTest():
 
     ser = None                          # 测试持有的串口句柄，结束时关闭
     worker = None                       # 温度采集线程句柄，创建失败时仍为 None
-    stop_event = threading.Event()      # 测试主线程与采集线程共用的停止通知
+    ut3200_stop_event = threading.Event()      # 测试主线程与采集线程共用的停止通知
     try:
         # ut3200_routes 为（设备下标、信号下标、温度数组下标）的三元组列表，各下标从 0 开始。
         # 打开串口也放入清理范围。
@@ -249,7 +253,7 @@ def HAL_UT3200_RunTest():
             return
         worker = threading.Thread(
             target=HAL_UT3200_CollectTempData_Thread,
-            args=(ser, stop_event, ut3200_routes, BLL_DataWrite),
+            args=(ser, ut3200_stop_event, ut3200_routes, BLL_DataWrite),
             daemon=True,
         )
         worker.start()
@@ -259,7 +263,7 @@ def HAL_UT3200_RunTest():
     except Exception as error:
         print(f"[UT3200] 测试失败：{error}")
     finally:
-        stop_event.set()
+        ut3200_stop_event.set()
         # 线程可能还没创建，或者启动失败
         if worker is not None and worker.is_alive():
             worker.join()

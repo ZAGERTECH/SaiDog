@@ -23,7 +23,6 @@ from dataclasses import dataclass, field, fields,asdict
 from readerwriterlock import rwlock
 import HAL_startup_shutdown
 import threading
-from datetime import datetime
 
 # ============================================================
 # 一、数据结构定义（字段显式声明）
@@ -67,7 +66,7 @@ class Signal:
     max: float | None = None                  # 量程上限
     fmt: str = ""                             # 显示格式，如 "{:.1f}"
     value: float | str | None = None          # 最新值（运行时由驱动写入）
-    ts: str = ""                              # 最新值的时间戳（年-月-日 时:分:秒.毫秒）
+    ts: str = ""                              # 最新值在采集端的时间戳（年-月-日 时:分:秒.毫秒）
 
 
 _SIGNAL_FIELDS = {f.name for f in fields(Signal)}   # 信号字段名集合（只算一次）
@@ -189,8 +188,8 @@ def BLL_GetDevicesSnapshot():
             raise RuntimeError("未初始化，请先调用 BLL_JSON_InitDevices(配置文件路径)")
         return {"devices": [asdict(device) for device in _DEVICES]}
 
-#写入接口函数，HAL层数据由此传入
-def BLL_DataWrite(updates):
+# HAL 将一批采集值和这一批的采集时间一起传入。
+def BLL_DataWrite(updates, timestamp):
     """将 HAL 的一批采集值写入 DataHub。
 
     updates 约定为 list[tuple[int, int, float | str | None]]，每项恰有三项：
@@ -199,18 +198,19 @@ def BLL_DataWrite(updates):
         第 2 项：该设备 signals 中的信号下标，从 0 开始，不是 Signal.id 或 ch。
         第 3 项：实际采集值；串口驱动传 float，UDP 驱动传原始字段 str；
                  Signal.value 也允许 None。本接口不做数值转换或量程校验。
-    例如 [(1, 0, 25.6)] 表示把第 2 个设备的第 1 条信号写为 25.6。
-    空列表不写入；同批数据共用一个本地时间戳，重复目标以最后一次赋值为准。
+    timestamp：HAL 在采集到本批数据时记录的本地时间字符串，精确到毫秒。
+    例如 [(1, 0, 25.6)] 表示把第 2 个设备的第 1 条信号写为 25.6，时间写为 timestamp。
+    空列表不写入；同批数据保存相同时间，重复目标以最后一次赋值为准。
 
     调用方必须保证三元组格式正确且下标在当前配置范围内（不使用负下标）。
     本接口直接解包和索引，不预校验整批数据；中途出错时已写入项不会回滚。
     """
     if not updates:
         return
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # 本批写入时间，精确到毫秒
     with _RWLOCK_DEVICE.gen_wlock():
         for device_index, signal_index, value in updates:
             signal = _DEVICES[device_index].signals[signal_index]
+            # 在同一把写锁下更新数值和采集时间，确保读取快照时两者对应。
             signal.value = value
             signal.ts = timestamp
 

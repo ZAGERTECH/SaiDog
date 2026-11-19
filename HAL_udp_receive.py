@@ -53,8 +53,9 @@ def HAL_Dog_ReceiveData_Thread(sock, stop_event,dog_routes, data_write_callback)
     sock：HAL_Dog_Open 返回的 UDP 句柄，本线程不负责关闭。
     stop_event：threading.Event，设置后停止采集，接收等待受 sock 的超时约束。
     dog_routes：[(设备下标, 设备内信号下标, 报文字段下标), ...]，三项均从 0 开始。
-    data_write_callback：接收 updates 列表的可调用对象，通常为 BLL_DataWrite；
-        每项是 (设备下标, 信号下标, 字段字符串)，回调返回值不使用。
+    data_write_callback：通常为 BLL_DataWrite，调用形式为 (updates, timestamp)。
+        updates 每项是 (设备下标, 信号下标, 字段字符串)。
+        timestamp 是本机收到本次 UDP 报文的时间，精确到毫秒。返回值不使用。
         报文中缺失的字段不提交，对应信号保留旧值；字段不转换为 float。
     """
     try:
@@ -70,7 +71,8 @@ def HAL_Dog_ReceiveData_Thread(sock, stop_event,dog_routes, data_write_callback)
             if stop_event.is_set():
                 break
 
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")  # 日志接收时间，非 BLL 写入时间
+            # 收到 UDP 报文后、解码前记录本机时间，整条报文共用这个时间戳。
+            timestamp = datetime.datetime.now().isoformat(sep=" ", timespec="milliseconds")
             try:
                 text = data.decode("utf-8")
             except ValueError as error:
@@ -89,8 +91,9 @@ def HAL_Dog_ReceiveData_Thread(sock, stop_event,dog_routes, data_write_callback)
                     updates.append(
                         (device_index,signal_index,values_udp[source_index])
                                    )
-            data_write_callback(updates)
-            print(f'{timestamp}来自{address}:{values_udp}')
+            # 将报文接收时间和解析出的信号一起交给 BLL，接收日志也使用这个时间。
+            data_write_callback(updates, timestamp)
+            print(f'[Dog UDP] {timestamp} 来自{address}: {values_udp}')
     finally:
         stop_event.set()
         print("接收线程已结束")
@@ -104,7 +107,7 @@ def HAL_Dog_RunTest():
 
     sock = None                         # UDP 句柄，测试结束后由本函数关闭
     receiver_thread = None               # 接收线程句柄，创建失败时仍为 None
-    stop_event = threading.Event()      # 测试主线程与接收线程共用的停止通知
+    dog_stop_event = threading.Event()      # 测试主线程与接收线程共用的停止通知
     try:
         # dog_routes：[(设备下标, 信号下标, 报文字段下标), ...]，各下标从 0 开始。
         sock ,dog_routes= HAL_Dog_Open(snapshot,host="0.0.0.0", port=8080, timeout=3.0)
@@ -112,12 +115,12 @@ def HAL_Dog_RunTest():
         print(f"UDP 已打开，绑定 {host}:{port}")
         receiver_thread = threading.Thread(
             target=HAL_Dog_ReceiveData_Thread,
-            args=(sock, stop_event,dog_routes,BLL_DataWrite),
+            args=(sock, dog_stop_event,dog_routes,BLL_DataWrite),
             daemon=False
         )
         receiver_thread.start()
         print("线程已启动")
-        while not stop_event.wait(0.5):
+        while not dog_stop_event.wait(0.5):
             pass
     except (OSError, ValueError) as error:
         print(f"UDP 初始化或打开失败：{error}")
@@ -125,7 +128,7 @@ def HAL_Dog_RunTest():
         print("\n收到退出请求")
 
     finally:
-        stop_event.set()
+        dog_stop_event.set()
         if receiver_thread is not None and receiver_thread.is_alive():
             receiver_thread.join()  # 先等待接收线程退出
         if sock is not None:
