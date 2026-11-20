@@ -48,10 +48,9 @@ def HAL_Dog_Open(snapshot,host="0.0.0.0", port=8080, timeout=3.0):
     return sock,routes
 
 def HAL_Dog_ReceiveData_Thread(sock, stop_event,dog_routes, data_write_callback):
-    """循环收报文并提交三元组列表；退出时设置共享停止事件。
-
+    """循环接收 Dog 报文并批量提交读数。退出时设置本设备的停止事件。
     sock：HAL_Dog_Open 返回的 UDP 句柄，本线程不负责关闭。
-    stop_event：threading.Event，设置后停止采集，接收等待受 sock 的超时约束。
+    stop_event：由 Dog 启停逻辑和接收线程共用。接收等待受 socket 超时约束。
     dog_routes：[(设备下标, 设备内信号下标, 报文字段下标), ...]，三项均从 0 开始。
     data_write_callback：通常为 BLL_DataWrite，调用形式为 (updates, timestamp)。
         updates 每项是 (设备下标, 信号下标, 字段字符串)。
