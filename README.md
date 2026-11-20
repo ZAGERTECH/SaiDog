@@ -1,4 +1,3 @@
-# Seres RoboDog
 
 UT3200 系列仪器串口温度采集脚本。
 
