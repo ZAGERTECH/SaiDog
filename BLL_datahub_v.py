@@ -1,13 +1,14 @@
 # 管理设备配置、采集数据和 HAL 启停。
 
+import csv
 import json
 import threading
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 
 from readerwriterlock import rwlock
 
 import HAL_startup_shutdown
-
 
 # ============================================================
 # 一、数据结构定义（字段显式声明）
@@ -173,7 +174,104 @@ def BLL_DataWrite(updates, timestamp):
 # 五、CSV 存储（10Hz）
 # ============================================================
 
-# 预留 CSV 存储实现。
+# 每 0.1 秒（10Hz）把各启用信号的「最新值 + 采集时间」写一行到 csv。
+# UI 按下「开始存储」调用 BLL_CSV_Start，每次新建一个「年-月-日-时-分-秒.csv」；
+# 按下「停止存储」调用 BLL_CSV_Stop 关闭文件。文件名位于程序当前工作目录。
+
+_CSV_THREAD = None              # CSV 存储线程句柄
+_CSV_STOP_EVENT = threading.Event()  # 存储线程的停止通知
+_CSV_FILE = None                # 当前打开的 csv 文件句柄
+_CSV_WRITER = None              # csv 写入器
+_CSV_INTERVAL = 0.1             # 存储周期（秒），10Hz
+
+
+def _BLL_CSV_CollectSignals():
+    """返回需要存储的信号列表，跳过 enabled=False 的信号（与 HAL 路由一致）。"""
+    with _RWLOCK_DEVICE.gen_rlock():
+        return [
+            signal
+            for device in _DEVICES
+            for signal in device.signals
+            if signal.enabled is not False
+        ]
+
+
+def _BLL_CSV_SignalLabel(signal):
+    """返回信号在表头里的列名，例如「左前腿髋关节电流（A）」。"""
+    if signal.unit:
+        return f"{signal.name}（{signal.unit}）"
+    return signal.name
+
+
+def _BLL_CSV_Header(signals):
+    """表头：每个信号占两列，依次为「名称（单位）,时间」。"""
+    header = []
+    for signal in signals:
+        header.append(_BLL_CSV_SignalLabel(signal))
+        header.append("时间")
+    return header
+
+
+def _BLL_CSV_CollectRow(signals):
+    """在读锁内读取一行数据：每个信号的「值,采集时间」。"""
+    row = []
+    with _RWLOCK_DEVICE.gen_rlock():
+        for signal in signals:
+            row.append(signal.value if signal.value is not None else "None")
+            row.append(signal.ts)
+    return row
+
+
+def _BLL_CSV_Store_Thread():
+    """每 0.1 秒读取一次信号并写入 csv，收到停止通知后退出并关闭文件。"""
+    try:
+        signals = _BLL_CSV_CollectSignals()
+        while not _CSV_STOP_EVENT.wait(_CSV_INTERVAL):
+            _CSV_WRITER.writerow(_BLL_CSV_CollectRow(signals))
+            _CSV_FILE.flush()  # 立即写盘，避免意外退出丢失数据
+    finally:
+        if _CSV_FILE is not None:
+            _CSV_FILE.close()
+
+
+def BLL_CSV_Start():
+    """开始 CSV 存储：新建「年-月-日-时-分-秒.csv」并启动存储线程。
+
+    成功返回文件名；已有存储在进行中时抛出 RuntimeError。
+    """
+    global _CSV_THREAD, _CSV_FILE, _CSV_WRITER
+    if _CSV_THREAD is not None and _CSV_THREAD.is_alive():
+        raise RuntimeError("CSV 存储已在进行中，请先停止")
+
+    signals = _BLL_CSV_CollectSignals()
+    if not signals:
+        raise RuntimeError("没有可存储的信号，请先初始化设备并启用信号")
+
+    filename = datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".csv"
+    # newline="" 避免 Windows 下出现多余空行；utf-8-sig 让 Excel 打开中文不乱码。
+    _CSV_FILE = open(filename, "w", newline="", encoding="utf-8-sig")
+    _CSV_WRITER = csv.writer(_CSV_FILE)
+    _CSV_WRITER.writerow(_BLL_CSV_Header(signals))
+
+    _CSV_STOP_EVENT.clear()
+    _CSV_THREAD = threading.Thread(
+        target=_BLL_CSV_Store_Thread,
+        name="bll_csv_store",
+        daemon=True,
+    )
+    _CSV_THREAD.start()
+    return filename
+
+
+def BLL_CSV_Stop():
+    """停止 CSV 存储，等待存储线程退出并关闭文件。"""
+    global _CSV_THREAD, _CSV_FILE, _CSV_WRITER
+    _CSV_STOP_EVENT.set()
+    if _CSV_THREAD is not None and _CSV_THREAD.is_alive():
+        _CSV_THREAD.join(timeout=3)
+    _CSV_THREAD = None
+    _CSV_FILE = None
+    _CSV_WRITER = None
 
 
 # ============================================================
