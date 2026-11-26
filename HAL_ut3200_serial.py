@@ -1,5 +1,5 @@
 """通过串口查询 UT3200 温度，将通道数据映射为 BLL 的批量写入列表。"""
-
+from HAL_error_queue import report_device_error
 import time
 from datetime import datetime
 import serial          
@@ -225,6 +225,7 @@ def HAL_UT3200_CollectTempData_Thread(ser, stop_event,ut3200_routes, data_write_
             else:
                 next_t = time.monotonic()     # 本周期已超时，从当前时间重新计时，避免连续追赶采样
     except Exception as error:
+        report_device_error("UT3200", error)
         print(
             f"[UT3200] 采集线程异常："
             f"{type(error).__name__}: {error}"

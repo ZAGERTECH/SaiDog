@@ -1,5 +1,5 @@
 """接收机器狗的 UTF-8 逗号分隔报文，按配置位置映射到 BLL 信号。"""
-
+from HAL_error_queue import report_device_error
 import socket
 import datetime
 import threading
@@ -65,6 +65,7 @@ def HAL_Dog_ReceiveData_Thread(sock, stop_event,dog_routes, data_write_callback)
             except TimeoutError:
                 continue
             except OSError as error:
+                report_device_error("UDP", error)
                 print(f'接受失败，停止接收：{error}')
                 return
             if stop_event.is_set():
@@ -95,7 +96,7 @@ def HAL_Dog_ReceiveData_Thread(sock, stop_event,dog_routes, data_write_callback)
             print(f'[Dog UDP] {timestamp} 来自{address}: {values_udp}')
     finally:
         stop_event.set()
-        print("接收线程已结束")
+        print("UDP接收线程已结束")
 
 def HAL_Dog_RunTest():
     """单独测试 Dog 的采集和 DataHub 写入。"""
@@ -122,6 +123,7 @@ def HAL_Dog_RunTest():
         while not dog_stop_event.wait(0.5):
             pass
     except (OSError, ValueError) as error:
+        report_device_error("UDP", error)
         print(f"UDP 初始化或打开失败：{error}")
     except KeyboardInterrupt:
         print("\n收到退出请求")

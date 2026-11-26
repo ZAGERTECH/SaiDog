@@ -5,7 +5,7 @@ import json
 import threading
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
-
+from math import isfinite
 from readerwriterlock import rwlock
 
 import HAL_startup_shutdown
@@ -61,7 +61,7 @@ _RWLOCK_DEVICE = rwlock.RWLockWrite()
 
 
 # ============================================================
-# 三、JSON 相关：加载配置 / 初始化 / 取快照
+# 三、JSON 相关：加载配置 / 初始化 / 取快照/
 # ============================================================
 
 def BLL_JSON_LoadDevices(json_path):
@@ -146,7 +146,7 @@ def BLL_GetDevicesSnapshot():
 
 
 # ============================================================
-# 四、数据写入：HAL 采集值由此传入
+# 四、数据写入：HAL 采集值由此传入/ 判断温度是否超出上下限
 # ============================================================
 
 def BLL_DataWrite(updates, timestamp):
@@ -168,6 +168,39 @@ def BLL_DataWrite(updates, timestamp):
             # 在同一把写锁下更新值和时间，保证快照中的两者对应。
             signal.value = value
             signal.ts = timestamp
+
+def BLL_CheckTemperatureSnapshot(snapshot, previous_states):
+    states = previous_states.copy()
+    messages = []
+    for device in snapshot["devices"]:
+        for signal in device["signals"]:
+            if signal["enabled"] is False or signal["unit"] != "°C":
+                continue
+
+            try:
+                value = float(signal["value"])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not isfinite(value):
+                continue
+
+            signal_id = signal["id"]
+            low, high = signal["min"], signal["max"]
+            if low is not None and value < low:
+                state,limit = "超出下限",low
+            elif high is not None and value > high:
+                state,limit= "超出上线",high
+            else:
+                states.pop(signal_id,None)
+                continue
+
+            if previous_states.get(signal_id) != state :
+                messages.append(
+                    f'{signal["ts"]}  温度报警 · {signal["name"]} '
+                    f'{value:g} °C，{state} {limit:g} °C'
+                )
+            states[signal_id] = state
+    return  states, messages
 
 
 # ============================================================
@@ -220,7 +253,6 @@ def _BLL_CSV_CollectRow(signals):
             row.append(signal.value if signal.value is not None else "None")
             row.append(signal.ts)
     return row
-
 
 def _BLL_CSV_Store_Thread():
     """每 0.1 秒读取一次信号并写入 csv，收到停止通知后退出并关闭文件。"""
@@ -341,6 +373,26 @@ def BLL_StopDog():
 
 def BLL_StopUT3200():
     HAL_startup_shutdown.HAL_UT3200_Stop()
+
+def BLL_ShutDowmAll():
+    # 先给三项任务都发出停止通知。
+    HAL_startup_shutdown.HAL_RequestDeviceStops()
+    _CSV_STOP_EVENT.set()
+
+    errors = []
+    for name, stop in (
+            ("UDP", BLL_StopDog),
+            ("UT3200", BLL_StopUT3200),
+            ("CSV", BLL_CSV_Stop),
+    ):
+        try:
+            # 执行已有的停止流程，等待线程并关闭资源。
+            stop()
+        except Exception as error:
+            errors.append(f'{name}: {error}')
+
+    if errors:
+        raise  RecursionError("\n".join(errors))
 
 
 def BLL_RoboDogDetect(json_path):

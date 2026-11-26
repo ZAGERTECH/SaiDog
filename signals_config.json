@@ -13,7 +13,7 @@
           "name": "左前腿髋关节绕组温度",
           "unit": "°C",
           "min": -20,
-          "max": 150,
+          "max": 24,
           "fmt": "{:.1f}"
         },
         {
@@ -22,7 +22,7 @@
           "name": "左前腿髋关节壳体温度",
           "unit": "°C",
           "min": -20,
-          "max": 150,
+          "max": 24,
           "fmt": "{:.1f}"
         },
         {
@@ -83,7 +83,7 @@
         },
         {
           "id": "ut3200_ch5",
-          "enabled": false,
+          "enabled": true,
           "ch": 5,
           "name": "UT3200+ 通道5 温度",
           "unit": "°C",
@@ -93,7 +93,7 @@
         },
         {
           "id": "ut3200_ch6",
-          "enabled": false,
+          "enabled": true,
           "ch": 6,
           "name": "UT3200+ 通道6 温度",
           "unit": "°C",
@@ -103,7 +103,7 @@
         },
         {
           "id": "ut3200_ch7",
-          "enabled": false,
+          "enabled": true,
           "ch": 7,
           "name": "UT3200+ 通道7 温度",
           "unit": "°C",
@@ -113,7 +113,7 @@
         },
         {
           "id": "ut3200_ch8",
-          "enabled": false,
+          "enabled": true,
           "ch": 8,
           "name": "UT3200+ 通道8 温度",
           "unit": "°C",

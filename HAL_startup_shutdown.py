@@ -115,6 +115,9 @@ def HAL_Dog_Stop():
     thread_dog = None
     sock = None
 
+def HAL_RequestDeviceStops():
+    ut3200_stop_event.set()
+    dog_stop_event.set()
 
 
 
