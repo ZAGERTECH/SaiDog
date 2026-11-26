@@ -69,10 +69,9 @@ def HAL_UT3200_SndCmd(ser,cmd):
     data = (cmd + "\n").encode("ascii")    # 串口发送的 ASCII 字节，换行用于结束一条命令
     ser.write(data)                          #ser.write()方法发送字节数据
     print(f'已发送指令：{cmd}')
-    pass
 
 def HAL_UT3200_ReadResponse(ser):
-    """从已打开的串口 ser 读取一行 ASCII 文本；换行或读取超时结束，无内容返回空串。"""
+    """从串口读取一行 ASCII 文本。遇到行尾或超时后返回已收到的内容。"""
     buffer = bytearray()                    # 累积本条回复字节，不包含行尾 CR/LF
     while True:
         byte = ser.read(1)
@@ -100,9 +99,9 @@ def HAL_UT3200_Query(ser,cmd):
 def HAL_UT3200_FetchTemperatures(ser):
     """通过已打开的串口 ser 查询温度，返回 list[float]；无回复返回 None。
 
-    按回复字段顺序转换为浮点数（项目配置的温度单位为 °C），空字段或无法解析的字段
-    会被跳过，因此有回复但没有有效数值时返回 []。路由按 ch - 1 取值，依赖仪器按
-    通道顺序返回完整数值；当前解析若跳过中间字段，后续元素会前移，不能视为保留通道占位。
+    实机回复可能以逗号结尾，分割产生的最后一个空字段会被跳过。
+    当前解析也会跳过中间的空字段或无法转换的字段，这会使后续数值前移。
+    路由按 ch - 1 取值，因此依赖仪器按通道顺序返回完整数值。
     """
     reply = HAL_UT3200_Query(ser, "FETCH?")
     if not reply:
@@ -130,9 +129,9 @@ def HAL_UT3200_SetUpInstruments(ser):
     """
     print("-" * 50)
     HAL_UT3200_Query(ser, f"MEAS:MODEL {CONFIG['type']}")   # 设置传感器类型
-    HAL_UT3200_Query(ser, "MEAS:MODEL?")                    # 读回来确认一下
+    HAL_UT3200_Query(ser, "MEAS:MODEL?")                    # 查询当前传感器类型
     HAL_UT3200_Query(ser, "MEAS:RATE fast")                 # 快速模式
-    HAL_UT3200_Query(ser, "MEAS:RATE?")                     # 确认设置成功
+    HAL_UT3200_Query(ser, "MEAS:RATE?")                     # 查询当前采样速率
     HAL_UT3200_Query(ser, "MEAS:START on")                  # 启动采样
     print("[OK] 仪器配置完成，开始采样。\n")
 
@@ -188,10 +187,10 @@ def HAL_UT3200_InitDevice(snapshot):
 
 #创建采集函数（线程 target：循环采集温度，直到 stop_event 被设置）
 def HAL_UT3200_CollectTempData_Thread(ser, stop_event,ut3200_routes, data_write_callback):
-    """定期查询温度并提交一批更新；退出时设置共享停止事件。
+    """定期查询温度并批量提交读数。退出时设置本设备的停止事件。
 
     ser：已配置的串口句柄，本线程不负责关闭。
-    stop_event：threading.Event，由主线程或任一采集线程设置以通知停止。
+    stop_event：由 UT3200 启停逻辑和采集线程共用的停止事件。
     ut3200_routes：[(设备下标, 设备内信号下标, 温度数组下标), ...]，三项均从 0 开始。
     data_write_callback：通常为 BLL_DataWrite，调用形式为 (updates, timestamp)。
         updates 每项为 (设备下标, 信号下标, float 温度值)。

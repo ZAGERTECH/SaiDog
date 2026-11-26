@@ -1,116 +1,87 @@
-# DataHub_v3.0（dataclass 列表版，2026-10-29）
-#
-# 管理 JSON 配置对应的 list[Device]，提供线程安全的批量写入和快照，编排 HAL 启停。
-#
-# 与 v2.0 的区别：不再有 DataHub 类。
-#   初始化完成后留在全局空间的，就是 Device 列表本身（Device.signals 里是一堆
-#   Signal 对象）。读写都是直接操作这些 dataclass 对象
-#
-# 程序与 JSON 之间只有三条约定：
-#   1. 每个设备必须有 "id"，且设备之间唯一
-#   2. 每条信号必须有 "id"，且全项目唯一 —— 按 id 查找时用
-#   3. 必须有一个 devices 数组
-#
-# 取舍说明（重要）：
-#   字段在类里显式定义 = "看得见的字段清单"；
-#   代价是 JSON 新增字段时必须在类里同步加一行（下面"新增字段怎么改"有清单）。
-#   加载时遇到类里没有的字段会直接报错，不静默丢弃——
-#   不会出现"JSON 里明明写了，界面上却没有"这种查不出来的问题。
-#   enabled 是普通数据（null=待定 / true=启用 / false=停用），
-#   加载不跳过任何信号 —— 要不要采集由驱动自己读这一列决定。
+# 管理设备配置、采集数据和 HAL 启停。
+
+import csv
 import json
-from dataclasses import dataclass, field, fields,asdict
-from readerwriterlock import rwlock
-import HAL_startup_shutdown
 import threading
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
+
+from readerwriterlock import rwlock
+
+import HAL_startup_shutdown
 
 # ============================================================
 # 一、数据结构定义（字段显式声明）
 # ============================================================
-#
-# ---------- 新增一个 JSON 字段，要改哪些代码 ----------
-#   信号级字段（例：规约里多了一个"安装位置"）：
-#     1. signals_config.json：每条信号加上  "position": "左前腿髋关节"
-#     2. 下面 Signal 类里加一行  position: str = ""
-#        （只有这一处是必须的；加在哪个位置，列的显示顺序就是那个位置）
-#     3. 本文件其余地方不用动：列名、行字典、快照都是从类自动取的
-#     4. 界面要显示 → UI 加一列；驱动要用 → s.position 点出来
-#
-#   设备级字段（例：每个设备多一个"安装位置"）：
-#     1. signals_config.json：设备层加上这个字段
-#     2. Device 类里加一行，并在 BLL_JSON_LoadDevices 构造 Device 时读取该字段
-#     3. BLL_GetDevicesSnapshot 会自动把该字段放入设备字典
-#
-#   注意：JSON 加了、类忘了加，加载时会报错提醒。
-# ------------------------------------------------------
+
+# 新增 JSON 字段时，在 signals_config.json 和对应的 dataclass 中同步声明。
+# 信号级字段（如 position）加到 Signal，加载和快照会自动读取已声明的信号字段。
+# 设备级字段加到 Device，还要在 BLL_JSON_LoadDevices 构造 Device 时读取。
+# 界面要展示新增字段时，需在 UI 中增加对应列。
 
 @dataclass
 class Device:
-    # —— 一个设备 = 设备级字段 + 自己的信号列表 ——
-    id: str                                   # 必填，设备之间唯一，设备查找键
-    name: str = ""                            # 展示名（界面/日志显示用）
-    api: str = ""                             # 本设备信号的采集函数名
-    signals: list["Signal"] = field(default_factory=list)  # 按 JSON 顺序保存，下标供 HAL 路由使用
+    id: str  # 必填，设备间唯一，供 HAL 匹配设备
+    name: str = ""  # 设备展示名
+    api: str = ""  # 采集函数名
+    signals: list["Signal"] = field(default_factory=list)  # 按 JSON 顺序保存
 
 
 @dataclass
 class Signal:
-    # —— 一条信号自己的数据；设备级的 device_name / api 不在这里，
-    #    需要设备信息时，从所属 Device 对象读取 ——
-    id: str                                   # 必填，全项目唯一，读写查找键
-    enabled: bool | None = None               # null=待定 / true=启用 / false=停用
-    ch: int | None = None                     # UT3200 通道号（其他设备为 None）
-    name: str = ""                            # 展示名
-    unit: str = ""                            # 单位
-    min: float | None = None                  # 量程下限
-    max: float | None = None                  # 量程上限
-    fmt: str = ""                             # 显示格式，如 "{:.1f}"
-    value: float | str | None = None          # 最新值（运行时由驱动写入）
-    ts: str = ""                              # 最新值在采集端的时间戳（年-月-日 时:分:秒.毫秒）
-
-
-_SIGNAL_FIELDS = {f.name for f in fields(Signal)}   # 信号字段名集合（只算一次）
-_DEVICE_FIELDS = {f.name for f in fields(Device)}   # 设备字段名集合（只算一次）
+    # 设备名称和采集函数名从所属的 Device 读取。
+    id: str  # 必填，全项目唯一
+    enabled: bool | None = None  # None=待定 / True=启用 / False=停用
+    ch: int | None = None  # UT3200 通道号，从 1 开始
+    name: str = ""  # 信号展示名
+    unit: str = ""
+    min: float | None = None  # 量程下限
+    max: float | None = None  # 量程上限
+    fmt: str = ""  # 显示格式，如 "{:.1f}"
+    value: float | str | None = None  # 最新采集值，由 HAL 回调写入
+    ts: str = ""  # 采集端本地时间，格式为 YYYY-MM-DD HH:MM:SS.sss
 
 
 # ============================================================
-# 二、读 JSON -> list[Device]（初始化时跑一次）
+# 二、全局变量：初始化完成后留在内存里的状态
+# ============================================================
+
+SIGNALS_CONFIG_PATH = "signals_config.json"  # 命令行入口使用，路径相对于当前工作目录
+
+# 从 dataclass 提取字段名，用于校验 JSON 中的设备字段和信号字段。
+_SIGNAL_FIELDS = {f.name for f in fields(Signal)}
+_DEVICE_FIELDS = {f.name for f in fields(Device)}
+
+_DEVICES = []  # list[Device]，采集回调按设备及其 signals 的下标定位
+_DEBUG_THREAD = None  # 调试打印线程句柄
+
+# 多个读者可同时取快照，写入与其他读写互斥。写者排队时，新读者等待。
+# 锁内只做内存操作，文件、串口和网络 I/O 放在锁外。
+_RWLOCK_DEVICE = rwlock.RWLockWrite()
+
+
+# ============================================================
+# 三、JSON 相关：加载配置 / 初始化 / 取快照
 # ============================================================
 
 def BLL_JSON_LoadDevices(json_path):
-    """把磁盘上的 JSON 配置文件，解析成内存里的 list[Device]。
+    """从 json_path 加载设备配置，返回 list[Device]，保留设备和信号的配置顺序。
 
-    输入：json_path (str)
-        配置文件的路径字符串，例如 "signals_config.json" 或绝对路径。
-        函数内部用它 open + json.load，把文件内容解析成 Python 字典 cfg，
-        再从 cfg["devices"] 逐个搬成 Device / Signal 对象。
-
-    输出：devices (list[Device])
-        加载成功的设备列表，每个 Device 里挂着自己的 signals (list[Signal])。
-        保留 JSON 里的设备和信号配置顺序。
-        要么返回完整、合法的列表，要么中途 raise（不返回半截数据 / None）。
-
-    失败时：raise ValueError（由上层 try/except 接住）
-        - 配置缺 devices 数组
-        - 设备或信号缺 id
-        - 设备 id 重复 / 信号 id 全项目重复
-        - JSON 里出现 Device / Signal 类没声明的字段
-
-    注意：enabled=False 的信号仍保留在列表中，
-          保证路由下标不因停用而变化（要不要采集由驱动自己读这一列决定）。
+    配置按 {"devices": [{..., "signals": [...]}]} 分组。
+    缺少 devices、设备或信号缺少 ID、ID 重复或出现未声明字段时，抛出 ValueError。
+    停用信号仍在原来的位置。HAL 生成路由时跳过 enabled=False 的信号。
     """
-    # 只认设备分组写法 {"devices": [ {..., "signals": [ {...} ]} ]}
     with open(json_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)                      # 配置根字典，cfg["devices"] 为设备字典列表
+        cfg = json.load(f)
 
     if "devices" not in cfg:
         raise ValueError("配置缺少 devices 数组（只支持设备分组写法）: " + json_path)
 
-    devices = []                               # 加载结果 list[Device]，尚未发布到全局
-    seen_dev = set()                            # 设备 id 必填且唯一
-    seen_sig = set()                            # 信号 id 全项目唯一
+    devices = []
+    seen_dev = set()
+    seen_sig = set()
     for dev in cfg["devices"]:
-        did = dev.get("id")                     # 设备的字符串 ID，不是设备列表下标
+        did = dev.get("id")
         if not did:
             raise ValueError("有一个设备缺少 id 字段")
         if did in seen_dev:
@@ -124,14 +95,14 @@ def BLL_JSON_LoadDevices(json_path):
         d = Device(id=did, name=dev.get("name", ""), api=dev.get("api", ""))
 
         for sig in dev.get("signals", []):
-            sid = sig.get("id")                 # 信号的字符串 ID，不是信号列表下标
+            sid = sig.get("id")
             if not sid:
                 raise ValueError("设备 %s 下有一条信号缺少 id 字段" % d.id)
             if sid in seen_sig:
                 raise ValueError("信号 id 重复: " + repr(sid))
             seen_sig.add(sid)
 
-            s = Signal(id=sid)                  # 先给必填的 id，其余逐个填
+            s = Signal(id=sid)
             for k, v in sig.items():
                 if k == "id":
                     continue
@@ -139,37 +110,22 @@ def BLL_JSON_LoadDevices(json_path):
                     raise ValueError("信号 %r 的字段 %r 在 Signal 类里没有定义，"
                                      "请在 Signal 里加一行（例如 %s: str = \"\"）"
                                      % (sid, k, k))
-                setattr(s, k, v)                # 显式字段：直接赋给对象属性
+                setattr(s, k, v)
             d.signals.append(s)
         devices.append(d)
 
     return devices
 
 
-# ============================================================
-# 三、全局变量：初始化完成后留在内存里的就是这一个列表
-# ============================================================
-
-_DEVICES = []                                   # list[Device]；批量写入按此列表及其 signals 的下标定位
-_DEBUG_THREAD = None                            # 调试打印线程句柄；None 表示尚未创建或已清理
-# ---------- 读写锁（读读共享 / 读写互斥 / 写写互斥）----------
-# 选 RWLockWrite（写优先）：一旦有写者在排队，新来的读者先等一等，
-_RWLOCK_DEVICE = rwlock.RWLockWrite()
-#
-# 两条铁律：
-#   1. 锁内只放内存操作（赋值/浅拷贝），快进快出
-#   2. 锁内绝不做 I/O（文件、串口、网络）——I/O 先做完，再进锁写结果
-# -------------------------------------------------------------
-
-
 def BLL_JSON_InitDevices(json_path):
-    """加载配置路径 json_path 并替换全局设备列表；必须先关闭 HAL 资源。"""
-    # 启动时调一次：读 JSON → list[Device] 存进全局，不启动任何线程
-    # BLL_JSON_LoadDevices 里有文件 I/O，必须在锁外做完；锁内只"换引用"（一条赋值）
-    # 采集尚未关闭时，禁止替换线程正在使用的数据对象
+    """在 HAL 资源关闭后加载配置并替换全局设备列表。
+
+    采集线程持有按当前配置生成的路由，重新初始化前须先停止采集并释放资源。
+    """
     if HAL_startup_shutdown.HAL_HasResources():
         raise RuntimeError("HAL 尚未关闭，不能重新初始化 DataHub")
-    
+
+    # 在锁外读取并校验文件，成功后再持写锁一次性替换设备列表。
     devices = BLL_JSON_LoadDevices(json_path)
     global _DEVICES
     with _RWLOCK_DEVICE.gen_wlock():
@@ -177,67 +133,178 @@ def BLL_JSON_InitDevices(json_path):
 
 
 def BLL_GetDevicesSnapshot():
-    """返回独立字典快照，外部修改它不会影响内部设备数据。
+    """返回可独立修改的字典快照，供 UI 读取和 HAL 生成路由。
 
-    结构为 {"devices": [{"id": ..., "name": ..., "api": ..., "signals": [...]}]}，
-    signals 中每项是包含 Signal 全部字段的字典。列表顺序与 _DEVICES 一致，
-    HAL 据此生成路由；采集期间不能重排设备/信号或用旧路由写入新配置。
+    结构为 {"devices": [{"id": ..., "name": ..., "api": ..., "signals": [...]}]}。
+    每条信号以包含 Signal 全部字段的字典表示。设备和信号顺序与 _DEVICES 一致，
+    采集期间须保持这个顺序，才能让 HAL 的下标继续指向同一条信号。
     """
     with _RWLOCK_DEVICE.gen_rlock():
         if not _DEVICES:
             raise RuntimeError("未初始化，请先调用 BLL_JSON_InitDevices(配置文件路径)")
         return {"devices": [asdict(device) for device in _DEVICES]}
 
-# HAL 将一批采集值和这一批的采集时间一起传入。
+
+# ============================================================
+# 四、数据写入：HAL 采集值由此传入
+# ============================================================
+
 def BLL_DataWrite(updates, timestamp):
     """将 HAL 的一批采集值写入 DataHub。
 
-    updates 约定为 list[tuple[int, int, float | str | None]]，每项恰有三项：
-        (device_index, signal_index, value)
-        第 1 项：_DEVICES 中的设备下标，从 0 开始，不是 Device.id。
-        第 2 项：该设备 signals 中的信号下标，从 0 开始，不是 Signal.id 或 ch。
-        第 3 项：实际采集值；串口驱动传 float，UDP 驱动传原始字段 str；
-                 Signal.value 也允许 None。本接口不做数值转换或量程校验。
-    timestamp：HAL 在采集到本批数据时记录的本地时间字符串，精确到毫秒。
-    例如 [(1, 0, 25.6)] 表示把第 2 个设备的第 1 条信号写为 25.6，时间写为 timestamp。
-    空列表不写入；同批数据保存相同时间，重复目标以最后一次赋值为准。
+    updates 的每项为 (设备下标, 信号下标, 采集值)。两个下标从 0 开始，
+    分别索引 _DEVICES 和该设备的 signals。调用方须保证三元组格式和下标有效。
+    例如 [(1, 0, 25.6)] 将第 2 个设备的第 1 条信号写为 25.6。
 
-    调用方必须保证三元组格式正确且下标在当前配置范围内（不使用负下标）。
-    本接口直接解包和索引，不预校验整批数据；中途出错时已写入项不会回滚。
+    串口传 float，UDP 传原始字段 str，也允许传 None。采集值原样保存。
+    每批数据共用同一个 timestamp，即 HAL 记录的毫秒级本地采集时间。
+    空列表直接返回。重复目标以后一次写入为准，中途出错时已写入的项会保留。
     """
     if not updates:
         return
     with _RWLOCK_DEVICE.gen_wlock():
         for device_index, signal_index, value in updates:
             signal = _DEVICES[device_index].signals[signal_index]
-            # 在同一把写锁下更新数值和采集时间，确保读取快照时两者对应。
+            # 在同一把写锁下更新值和时间，保证快照中的两者对应。
             signal.value = value
             signal.ts = timestamp
+
+
+# ============================================================
+# 五、CSV 存储（10Hz）
+# ============================================================
+
+# 每 0.1 秒（10Hz）把各启用信号的「最新值 + 采集时间」写一行到 csv。
+# UI 按下「开始存储」调用 BLL_CSV_Start，每次新建一个「年-月-日-时-分-秒.csv」；
+# 按下「停止存储」调用 BLL_CSV_Stop 关闭文件。文件名位于程序当前工作目录。
+
+_CSV_THREAD = None              # CSV 存储线程句柄
+_CSV_STOP_EVENT = threading.Event()  # 存储线程的停止通知
+_CSV_FILE = None                # 当前打开的 csv 文件句柄
+_CSV_WRITER = None              # csv 写入器
+_CSV_INTERVAL = 0.1             # 存储周期（秒），10Hz
+
+
+def _BLL_CSV_CollectSignals():
+    """返回需要存储的信号列表，跳过 enabled=False 的信号（与 HAL 路由一致）。"""
+    with _RWLOCK_DEVICE.gen_rlock():
+        return [
+            signal
+            for device in _DEVICES
+            for signal in device.signals
+            if signal.enabled is not False
+        ]
+
+
+def _BLL_CSV_SignalLabel(signal):
+    """返回信号在表头里的列名，例如「左前腿髋关节电流（A）」。"""
+    if signal.unit:
+        return f"{signal.name}（{signal.unit}）"
+    return signal.name
+
+
+def _BLL_CSV_Header(signals):
+    """表头：每个信号占两列，依次为「名称（单位）,时间」。"""
+    header = []
+    for signal in signals:
+        header.append(_BLL_CSV_SignalLabel(signal))
+        header.append("时间")
+    return header
+
+
+def _BLL_CSV_CollectRow(signals):
+    """在读锁内读取一行数据：每个信号的「值,采集时间」。"""
+    row = []
+    with _RWLOCK_DEVICE.gen_rlock():
+        for signal in signals:
+            row.append(signal.value if signal.value is not None else "None")
+            row.append(signal.ts)
+    return row
+
+
+def _BLL_CSV_Store_Thread():
+    """每 0.1 秒读取一次信号并写入 csv，收到停止通知后退出并关闭文件。"""
+    try:
+        signals = _BLL_CSV_CollectSignals()
+        while not _CSV_STOP_EVENT.wait(_CSV_INTERVAL):
+            _CSV_WRITER.writerow(_BLL_CSV_CollectRow(signals))
+            _CSV_FILE.flush()  # 立即写盘，避免意外退出丢失数据
+    finally:
+        if _CSV_FILE is not None:
+            _CSV_FILE.close()
+
+
+def BLL_CSV_Start():
+    """开始 CSV 存储：新建「年-月-日-时-分-秒.csv」并启动存储线程。
+
+    成功返回文件名；已有存储在进行中时抛出 RuntimeError。
+    """
+    global _CSV_THREAD, _CSV_FILE, _CSV_WRITER
+    if _CSV_THREAD is not None and _CSV_THREAD.is_alive():
+        raise RuntimeError("CSV 存储已在进行中，请先停止")
+
+    signals = _BLL_CSV_CollectSignals()
+    if not signals:
+        raise RuntimeError("没有可存储的信号，请先初始化设备并启用信号")
+
+    filename = datetime.now().strftime("%Y-%m-%d-%H-%M-%S") + ".csv"
+    # newline="" 避免 Windows 下出现多余空行；utf-8-sig 让 Excel 打开中文不乱码。
+    _CSV_FILE = open(filename, "w", newline="", encoding="utf-8-sig")
+    _CSV_WRITER = csv.writer(_CSV_FILE)
+    _CSV_WRITER.writerow(_BLL_CSV_Header(signals))
+
+    _CSV_STOP_EVENT.clear()
+    _CSV_THREAD = threading.Thread(
+        target=_BLL_CSV_Store_Thread,
+        name="bll_csv_store",
+        daemon=True,
+    )
+    _CSV_THREAD.start()
+    return filename
+
+
+def BLL_CSV_Stop():
+    """停止 CSV 存储，等待存储线程退出并关闭文件。"""
+    global _CSV_THREAD, _CSV_FILE, _CSV_WRITER
+    _CSV_STOP_EVENT.set()
+    if _CSV_THREAD is not None and _CSV_THREAD.is_alive():
+        _CSV_THREAD.join(timeout=3)
+    _CSV_THREAD = None
+    _CSV_FILE = None
+    _CSV_WRITER = None
+
+
+# ============================================================
+# 六、调试打印
+# ============================================================
 
 def BLL_Debug_PrintDevices_Thread():
     """每秒读取并打印一次设备快照，收到停止通知后退出。"""
     while not HAL_startup_shutdown.HAL_WaitForStop(1.0):
+        # 先取独立快照，再序列化并打印，让输出留在锁外。
         snapshot = BLL_GetDevicesSnapshot()
         print(
             "[BLL] 设备数据：\n"
             + json.dumps(snapshot, ensure_ascii=False, indent=2)
         )
 
+
 # ============================================================
-# 四、BLL 层线程编排（初始化 / 创建 / 停止）
+# 七、线程编排（初始化 / 启动 / 停止）
 # ============================================================
-# BLL 负责初始化 DataHub，并调用 HAL 的启动、关闭接口。
-# 硬件句柄、线程列表和停止标志由 HAL 管理。
+
+# BLL 初始化 DataHub 并调用各设备的启停接口。
+# 采集线程、通信句柄和各设备的停止事件由 HAL 管理。
+
 def BLL_All_InitSystem(json_path):
-    """按配置路径初始化数据、启动采集和打印线程；成功返回 True，普通异常返回 False。"""
+    """为命令行调试入口加载配置并启动打印线程。
+
+    成功返回 True，初始化或线程启动抛出普通异常时返回 False。
+    """
     global _DEBUG_THREAD
     try:
         BLL_JSON_InitDevices(json_path)
         print("[BLL] JSON 初始化成功")
-        snapshot = BLL_GetDevicesSnapshot()     # HAL 构造路由使用的配置快照，顺序与全局数据一致
-
-        HAL_startup_shutdown.HAL_Start(snapshot, BLL_DataWrite)
-
         try:
             print("[BLL] HAL 启动成功")
             _DEBUG_THREAD = threading.Thread(
@@ -247,10 +314,6 @@ def BLL_All_InitSystem(json_path):
             )
             _DEBUG_THREAD.start()
         except BaseException:
-            try:
-                BLL_Thread_StopAll()
-            except Exception as cleanup_error:
-                print(f"[BLL] 启动失败后清理未完成：{cleanup_error}")
             raise
 
         return True
@@ -259,44 +322,47 @@ def BLL_All_InitSystem(json_path):
         print("[BLL] 系统初始化失败：%s" % error)
         return False
 
-def BLL_Thread_StopAll():
-    # 统一停止：通知所有线程退出 → 等待 → 关硬件
-    global _DEBUG_THREAD
-    try:
-        HAL_startup_shutdown.HAL_Shutdown()
-    finally:
-        if _DEBUG_THREAD is not None:
-            if _DEBUG_THREAD.is_alive():
-                _DEBUG_THREAD.join()
-            _DEBUG_THREAD = None
-    print("[BLL] 所有线程已停止，硬件已关闭")
+
+# UI 先初始化 DataHub。启动时给 HAL 传入用于生成路由的快照及写入回调，
+# 采集线程收到一批数据后调用 BLL_DataWrite(updates, timestamp)。
+def BLL_StartDog():
+    snapshot = BLL_GetDevicesSnapshot()
+    HAL_startup_shutdown.HAL_Dog_Start(snapshot, BLL_DataWrite)
+
+
+def BLL_StartUT3200():
+    snapshot = BLL_GetDevicesSnapshot()
+    HAL_startup_shutdown.HAL_UT3200_Start(snapshot, BLL_DataWrite)
+
+
+def BLL_StopDog():
+    HAL_startup_shutdown.HAL_Dog_Stop()
+
+
+def BLL_StopUT3200():
+    HAL_startup_shutdown.HAL_UT3200_Stop()
+
 
 def BLL_RoboDogDetect(json_path):
-    """初始化系统，等待停止通知，最后关闭资源。"""
+    """运行命令行调试入口，加载配置并等待 HAL 系统停止通知或 Ctrl+C。"""
     if HAL_startup_shutdown.HAL_HasResources():
         print("[BLL] 系统已启动或上次关闭未完成，拒绝重复启动")
         return
     try:
-        if not BLL_All_InitSystem(json_path) :
+        if not BLL_All_InitSystem(json_path):
             print("[BLL] 初始化失败，程序退出")
             return
         print("\n程序运行中，按 Ctrl+C 停止...")
-        # 等待 HAL 的停止通知
         while not HAL_startup_shutdown.HAL_WaitForStop(0.2):
             pass
         print("[BLL] 收到 HAL 停止通知，正在关闭系统...")
     except KeyboardInterrupt:
         print("\n[BLL] 收到用户停止请求，正在关闭系统...")
-    finally:
-        try:
-            BLL_Thread_StopAll()
-        except Exception as error:
-            print("[BLL] HAL 关闭未完成：%s" % error)
 
-SIGNALS_CONFIG_PATH = "signals_config.json"     # 相对于程序当前工作目录的配置文件路径
 
 def main():
     BLL_RoboDogDetect(SIGNALS_CONFIG_PATH)
+
 
 if __name__ == "__main__":
     main()
