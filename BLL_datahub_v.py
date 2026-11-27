@@ -307,7 +307,70 @@ def BLL_CSV_Stop():
 
 
 # ============================================================
-# 六、调试打印
+# 六、数据超时清空（看门狗，5 秒循环）
+# ============================================================
+
+# 设备打开后启动：每 5 秒检查一次，把超过阈值仍未更新的信号 value 清空为 None，
+# 让界面能及时反映「设备停采 / 失联」的状态。判断依据是信号的时间戳 ts。
+
+_WATCHDOG_THREAD = None              # 看门狗线程句柄
+_WATCHDOG_STOP_EVENT = threading.Event()  # 看门狗线程的停止通知
+_WATCHDOG_INTERVAL = 5.0             # 循环周期（秒）：每 5 秒检查一次
+_WATCHDOG_TIMEOUT = 5.0              # 超时阈值（秒）：超过这个时间没更新就清空
+
+
+def _BLL_ParseTs(ts):
+    """把 ts 字符串解析成 datetime；空串或格式不对返回 None。"""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
+    except ValueError:
+        return None
+
+
+def _BLL_Watchdog_Thread():
+    """每 5 秒检查一次，把超过阈值仍未更新的信号 value 清空为 None。"""
+    while not _WATCHDOG_STOP_EVENT.wait(_WATCHDOG_INTERVAL):
+        now = datetime.now()
+        with _RWLOCK_DEVICE.gen_wlock():
+            for device in _DEVICES:
+                for signal in device.signals:
+                    if signal.value is None:
+                        continue
+                    last = _BLL_ParseTs(signal.ts)
+                    if last is None:
+                        continue
+                    if (now - last).total_seconds() > _WATCHDOG_TIMEOUT:
+                        signal.value = None
+                        signal.ts = ""
+
+
+def BLL_Watchdog_Start():
+    """启动数据超时清空线程；已在运行则忽略（不重复启动）。"""
+    global _WATCHDOG_THREAD
+    if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
+        return
+    _WATCHDOG_STOP_EVENT.clear()
+    _WATCHDOG_THREAD = threading.Thread(
+        target=_BLL_Watchdog_Thread,
+        name="bll_watchdog",
+        daemon=True,
+    )
+    _WATCHDOG_THREAD.start()
+
+
+def BLL_Watchdog_Stop():
+    """停止数据超时清空线程并等待其退出。"""
+    global _WATCHDOG_THREAD
+    _WATCHDOG_STOP_EVENT.set()
+    if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
+        _WATCHDOG_THREAD.join(timeout=3)
+    _WATCHDOG_THREAD = None
+
+
+# ============================================================
+# 七、调试打印
 # ============================================================
 
 def BLL_Debug_PrintDevices_Thread():
@@ -322,7 +385,7 @@ def BLL_Debug_PrintDevices_Thread():
 
 
 # ============================================================
-# 七、线程编排（初始化 / 启动 / 停止）
+# 八、线程编排（初始化 / 启动 / 停止）
 # ============================================================
 
 # BLL 初始化 DataHub 并调用各设备的启停接口。
@@ -360,11 +423,13 @@ def BLL_All_InitSystem(json_path):
 def BLL_StartDog():
     snapshot = BLL_GetDevicesSnapshot()
     HAL_startup_shutdown.HAL_Dog_Start(snapshot, BLL_DataWrite)
+    BLL_Watchdog_Start()  # 设备成功打开后，启动数据超时清空
 
 
 def BLL_StartUT3200():
     snapshot = BLL_GetDevicesSnapshot()
     HAL_startup_shutdown.HAL_UT3200_Start(snapshot, BLL_DataWrite)
+    BLL_Watchdog_Start()  # 设备成功打开后，启动数据超时清空
 
 
 def BLL_StopDog():
@@ -375,15 +440,16 @@ def BLL_StopUT3200():
     HAL_startup_shutdown.HAL_UT3200_Stop()
 
 def BLL_ShutDowmAll():
-    # 先给三项任务都发出停止通知。
     HAL_startup_shutdown.HAL_RequestDeviceStops()
     _CSV_STOP_EVENT.set()
+    _WATCHDOG_STOP_EVENT.set()
 
     errors = []
     for name, stop in (
             ("UDP", BLL_StopDog),
             ("UT3200", BLL_StopUT3200),
             ("CSV", BLL_CSV_Stop),
+            ("看门狗", BLL_Watchdog_Stop),
     ):
         try:
             # 执行已有的停止流程，等待线程并关闭资源。
